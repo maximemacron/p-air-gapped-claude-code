@@ -282,6 +282,54 @@ The Neo4j graph memory server gives Claude Code persistent, structured memory ac
 
 The MCP server runs as an `npx` subprocess of Claude Code and communicates with Neo4j over Bolt on `localhost:7687`.
 
+### CLAUDE.md — making memory use automatic
+
+Claude Code reads `CLAUDE.md` at session start and treats its content as standing instructions. Without it, memory tools are used only when explicitly asked.
+
+Place the file at `~/.claude/CLAUDE.md` (applies to every project) or in a project root `CLAUDE.md` (project-scoped). Exact content to copy:
+
+```
+# Memory
+
+You have access to a persistent graph memory through the graph-memory MCP
+server (tools: store_memory, search_memories, recall_memories,
+get_related_memories, create_relationship, update_memory).
+
+## Rules — follow these without being asked
+
+1. START OF SESSION
+   Call search_memories("{project name} overview") before reading any file.
+   If results exist, use them as your starting context.
+
+2. BEFORE READING ANY FILE
+   Call search_memories("{file path}").
+   Skip the file read if the memory already describes its purpose and contents.
+   Only read the file when you need a specific line or the memory is stale.
+
+3. AFTER ANALYSING A FILE OR MODULE
+   Call store_memory with:
+   - name: the file path
+   - content: its purpose, key exports, dependencies, and anything non-obvious
+   - category: "file"
+
+4. AFTER DISCOVERING AN ARCHITECTURE DECISION OR CONVENTION
+   Call store_memory with category "architecture".
+   Include the reason behind the decision if you know it.
+
+5. AFTER FINDING A BUG OR ISSUE
+   Call store_memory with category "bug".
+   Include file path, line range, and root cause.
+   Call create_relationship to link it to the relevant file memory.
+
+6. AFTER COMPLETING ANY TASK
+   Call store_memory with category "task".
+   Include: what was done, which files changed, and why.
+
+## What not to store
+Do not store information that is directly readable from the current code
+(e.g. exact function signatures). Store interpretation, intent, and findings.
+```
+
 ---
 
 ## What stays on your machine
