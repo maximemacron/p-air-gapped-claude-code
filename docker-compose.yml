@@ -1,0 +1,92 @@
+# =============================================================================
+# air-gapped-claude-code — Docker Compose
+#
+# Both images are pre-built and loaded from tarballs by 02_install_airgap.sh.
+# No build step here. Just: docker compose up -d
+#
+# Architecture:
+#
+#   HOST (Claude Code, MCP server)
+#     │  localhost:8000  →  vLLM  (OpenAI-compatible API)
+#     │  localhost:7687  →  Neo4j (Bolt, graph memory)
+#     │  localhost:7474  →  Neo4j Browser (demo UI)
+# =============================================================================
+
+name: air-gapped-claude-code
+
+networks:
+  air-gapped-claude-code-net:
+    driver: bridge
+
+services:
+
+  # ── vLLM inference engine ──────────────────────────────────────────────────
+  # Image is fully self-contained: Python 3.12 + torch/CUDA + vLLM + model.
+  # No volume mounts needed.
+  vllm:
+    image: air-gapped-claude-code-vllm:latest
+    container_name: air-gapped-claude-code-vllm
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    ports:
+      - "127.0.0.1:8000:8000"
+
+    networks:
+      - air-gapped-claude-code-net
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - VLLM_NO_USAGE_STATS=1
+      - DO_NOT_TRACK=1
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 5
+
+    restart: unless-stopped
+
+  # ── Neo4j graph memory ─────────────────────────────────────────────────────
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: air-gapped-claude-code-neo4j
+
+    volumes:
+      - ${NEO4J_DATA:-./neo4j-data}:/data
+      - neo4j-logs:/logs
+
+    ports:
+      - "127.0.0.1:7474:7474"   # Neo4j Browser (demo)
+      - "127.0.0.1:7687:7687"   # Bolt — MCP server on host connects here
+
+    networks:
+      - air-gapped-claude-code-net
+
+    environment:
+      - NEO4J_AUTH=neo4j/ac4Sw1Q3Y4W834ctwpNaOq8
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_memory_heap_initial__size=512m
+      - NEO4J_dbms_memory_heap_max__size=1G
+      - NEO4J_dbms_memory_pagecache_size=512m
+
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "ac4Sw1Q3Y4W834ctwpNaOq8", "RETURN 1"]
+      interval: 20s
+      timeout: 10s
+      start_period: 30s
+      retries: 5
+
+    restart: unless-stopped
+
+volumes:
+  neo4j-logs:

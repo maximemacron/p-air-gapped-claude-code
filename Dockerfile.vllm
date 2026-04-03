@@ -1,0 +1,83 @@
+# =============================================================================
+# air-gapped-claude-code — Self-contained vLLM + Qwen inference image
+#
+# Built ONCE on a connected machine. Contains everything needed to run
+# offline: Python 3.12, CUDA-bundled PyTorch, vLLM, and model weights.
+#
+# Base: python:3.12-slim (Debian Bookworm). No system CUDA installation
+#       needed — CUDA 12.4 runtime is bundled inside the torch wheel.
+#
+# Only host requirement on the air-gapped machine:
+#   - NVIDIA driver >= 525
+#   - nvidia-container-toolkit (installed by 02_install_airgap.sh)
+# =============================================================================
+FROM python:3.12-slim
+
+# ── System dependencies ───────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        git-lfs \
+    && git lfs install --skip-repo \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Non-root service account ──────────────────────────────────────────────────
+RUN groupadd -r vllm && useradd -r -g vllm -m -d /home/vllm vllm
+
+# ── PyTorch 2.10.0 with CUDA 13.0 runtime bundled ─────────────────────────────
+# Pinned to the exact version vLLM 0.19.0 resolves to, avoiding any silent
+# upgrade. The cu130 wheel ships the full CUDA runtime (~4 GB) — no
+# nvidia/cuda base image required.
+RUN pip install --no-cache-dir \
+    "torch==2.10.0+cu130" \
+    --index-url https://download.pytorch.org/whl/cu130
+
+# ── vLLM 0.19.0 + HuggingFace Hub CLI ─────────────────────────────────────────
+# --no-deps keeps pip from upgrading torch beyond the pinned version above.
+RUN pip install --no-cache-dir --no-deps vllm==0.19.0 \
+    && pip install --no-cache-dir "huggingface_hub[cli]>=0.24"
+
+# ── Download model weights (baked into image — no volume mount at runtime) ────
+# Qwen3.5-9B-Instruct: ~18 GB, MIT licensed, 32K context, tool-calling capable
+# Run as root so /usr/local/bin is on PATH, then hand ownership to vllm.
+#
+# HF_TOKEN is required if the model is gated (accept terms on huggingface.co first).
+# The secret is mounted only during this RUN step and never written to any image layer.
+# Pass it with:  docker build --secret id=HF_TOKEN,env=HF_TOKEN ...
+RUN --mount=type=secret,id=HF_TOKEN \
+    mkdir -p /models \
+    && python -c "\
+import os; \
+from huggingface_hub import snapshot_download; \
+secret = '/run/secrets/HF_TOKEN'; \
+token = open(secret).read().strip() if os.path.exists(secret) else None; \
+snapshot_download( \
+    repo_id='Qwen/Qwen3.5-9B', \
+    local_dir='/models/qwen3.5-9b', \
+    ignore_patterns=['*.gguf', 'original/*'], \
+    token=token, \
+)" \
+    && chown -R vllm:vllm /models
+
+USER vllm
+
+# ── Healthcheck ───────────────────────────────────────────────────────────────
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+  CMD curl -sf http://localhost:8000/health || exit 1
+
+# ── Inference server ──────────────────────────────────────────────────────────
+# served-model-name is set to a Claude model ID so Claude Code works without
+# extra configuration (it validates model names against this exact string).
+ENTRYPOINT ["python", "-m", "vllm.entrypoints.openai.api_server"]
+CMD [ \
+  "--model",                  "/models/qwen3.5-9b", \
+  "--served-model-name",      "claude-3-5-sonnet-20241022", \
+  "--dtype",                  "float16", \
+  "--gpu-memory-utilization", "0.88", \
+  "--max-model-len",          "32768", \
+  "--max-num-seqs",           "4", \
+  "--port",                   "8000", \
+  "--host",                   "0.0.0.0", \
+  "--enable-auto-tool-choice", \
+  "--tool-call-parser",       "hermes" \
+]
