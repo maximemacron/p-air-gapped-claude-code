@@ -1,0 +1,7 @@
+FROM ghcr.io/berriai/litellm:main-latest
+
+# Copy the configuration into the image so no mount is needed at runtime
+COPY litellm-config.yaml /app/config.yaml
+
+# Set the default command to use the baked-in config
+CMD ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]

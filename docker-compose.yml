@@ -26,7 +26,8 @@ services:
   vllm:
     image: air-gapped-claude-code-vllm:latest
     container_name: air-gapped-claude-code-vllm
-
+    expose:
+      - "8000"
     deploy:
       resources:
         reservations:
@@ -34,26 +35,32 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-
-    ports:
-      - "127.0.0.1:8000:8000"
-
     networks:
       - air-gapped-claude-code-net
-
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - VLLM_NO_USAGE_STATS=1
       - DO_NOT_TRACK=1
-
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       start_period: 120s
       retries: 5
+    restart: unless-stopped
 
+  # ── LiteLLM Bridge ─────────────────────────────────────────────────────────
+  # Standard Anthropic-to-OpenAI translation gateway
+  litellm:
+    image: air-gapped-claude-code-litellm:latest
+    container_name: air-gapped-claude-code-litellm
+    ports:
+      - "127.0.0.1:8000:4000"
+    networks:
+      - air-gapped-claude-code-net
+    depends_on:
+      - vllm
     restart: unless-stopped
 
   # ── Neo4j graph memory ─────────────────────────────────────────────────────

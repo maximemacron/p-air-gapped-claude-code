@@ -11,17 +11,11 @@
 #   - NVIDIA driver >= 525
 #   - nvidia-container-toolkit
 #
-# Model: Qwen2.5-14B-Instruct-GPTQ-Int4
-#   - Weights: ~8 GB (INT4 + GPTQ scales)
-#   - GPU: RTX 5000 Ada Generation (16 GB VRAM)
-#   - KV cache: FP8, ~6.4 GB available → ~68K token capacity
-#   - Max context: 65536 tokens (hardware ceiling on 16 GB; 128K would OOM)
-#
-# Layer order is intentional — model download is placed before any layer
-# likely to change so it is not re-fetched on every rebuild:
+# Layer order is intentional — model download (18 GB) is placed before any
+# layer likely to change so it is not re-fetched on every rebuild:
 #
 #   1. Base image      (vLLM + CUDA + torch — never changes for a given tag)
-#   2. Model download  (~8 GB — must not be invalidated by config changes)
+#   2. Model download  (18 GB — must not be invalidated by config changes)
 #   3. Runtime config  (USER, HEALTHCHECK, CMD — free to change)
 # =============================================================================
 FROM vllm/vllm-openai:v0.19.0
@@ -31,6 +25,8 @@ RUN groupadd -r vllm 2>/dev/null || true \
     && useradd -r -g vllm -m -d /home/vllm vllm 2>/dev/null || true
 
 # ── Download model weights (baked into image — no volume mount at runtime) ────
+# Qwen3.5-9B: ~18 GB, MIT licensed, 32K context, tool-calling capable.
+#
 # HF_TOKEN is required to download the model (accept terms on huggingface.co
 # first). The secret is mounted only during this RUN step and is never written
 # to any image layer.
@@ -48,8 +44,8 @@ from huggingface_hub import snapshot_download; \
 secret = '/run/secrets/HF_TOKEN'; \
 token = open(secret).read().strip() if os.path.exists(secret) else None; \
 snapshot_download( \
-    repo_id='Qwen/Qwen2.5-14B-Instruct-GPTQ-Int4', \
-    local_dir='/models/qwen2.5-14b-gptq-int4', \
+    repo_id='Qwen/Qwen3.5-9B', \
+    local_dir='/models/qwen3.5-9b', \
     ignore_patterns=['*.gguf', 'original/*'], \
     token=token, \
 )" \
@@ -57,24 +53,20 @@ snapshot_download( \
 
 USER vllm
 
-ENV VLLM_V1=0
-ENV VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-
 # ── Healthcheck ───────────────────────────────────────────────────────────────
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
   CMD curl -sf http://localhost:8000/health || exit 1
 
 # ── Inference server ──────────────────────────────────────────────────────────
-ENTRYPOINT ["vllm", "serve"]
+# served-model-name is set to a Claude model ID so Claude Code works without
+# extra configuration (it validates model names against this exact string).
+ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
 CMD [ \
-  "/models/qwen2.5-14b-gptq-int4", \
+  "--model",                  "/models/qwen3.5-9b", \
   "--served-model-name",      "claude-3-5-sonnet-20241022", \
-  "--quantization",           "gptq", \
-  "--gpu-memory-utilization", "0.90", \
-  "--max-model-len",          "65536", \
-  "--kv-cache-dtype",         "fp8", \
-  "--trust-remote-code", \
-  "--enforce-eager", \
+  "--dtype",                  "float16", \
+  "--gpu-memory-utilization", "0.88", \
+  "--max-model-len",          "32768", \
   "--max-num-seqs",           "4", \
   "--port",                   "8000", \
   "--host",                   "0.0.0.0", \

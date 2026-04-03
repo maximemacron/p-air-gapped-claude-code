@@ -4,7 +4,7 @@ Run [Claude Code](https://docs.anthropic.com/en/docs/claude-code) with a locally
 
 ## Problem statement
 
-Financial institutions, defence contractors, and healthcare providers routinely operate developer workstations in network-isolated environments: no outbound internet, strict data-residency requirements, and continuous monitoring for exfiltration. Commercial AI coding assistants send every prompt and code snippet to a remote API, which is incompatible with these controls. This project packages a production-grade OpenAI-compatible inference server (vLLM + Qwen3.5-9B) and a persistent graph memory store (Neo4j) into a Docker Compose stack that binds exclusively to `127.0.0.1`, satisfies a two-person rule for model provenance (weights are baked in at build time on a controlled connected machine), and requires zero network access at runtime. Claude Code connects to the local endpoint using the same API protocol it uses against Anthropic's servers.
+Financial institutions, defence contractors, and healthcare providers routinely operate developer workstations in network-isolated environments: no outbound internet, strict data-residency requirements, and continuous monitoring for exfiltration. Commercial AI coding assistants send every prompt and code snippet to a remote API, which is incompatible with these controls. This project packages a production-grade OpenAI-compatible inference server (vLLM + Qwen2.5-7B), a translation bridge (LiteLLM), and a persistent graph memory store (Neo4j) into a Docker Compose stack that binds exclusively to `127.0.0.1`, satisfies a two-person rule for model provenance (weights are baked in at build time on a controlled connected machine), and requires zero network access at runtime. Claude Code connects to the local LiteLLM endpoint, which translates Anthropic-style requests into vLLM-compatible commands.
 
 ---
 
@@ -17,11 +17,13 @@ graph TD
         MCP["MCP server\n(@neo4j/mcp-neo4j-memory\nnpx subprocess)"]
 
         subgraph DOCKER ["Docker network: air-gapped-claude-code-net (bridge)"]
-            VLLM["air-gapped-claude-code-vllm\nvLLM 0.19.0\nQwen3.5-9B\nPort 8000"]
+            LITE["air-gapped-claude-code-litellm\nLiteLLM Bridge\nPort 8000"]
+            VLLM["air-gapped-claude-code-vllm\nvLLM 0.19.0\nQwen2.5-7B-FP8\nInternal Port 8000"]
             NEO["air-gapped-claude-code-neo4j\nNeo4j 5.26 Community\nBolt 7687 / Browser 7474"]
         end
 
-        CC -- "HTTP POST /v1/chat/completions\nlocalhost:8000" --> VLLM
+        CC -- "HTTP POST /v1/messages\nlocalhost:8000" --> LITE
+        LITE -- "Translates to OpenAI API\nhttp://vllm:8000/v1" --> VLLM
         CC -- "spawns" --> MCP
         MCP -- "bolt://localhost:7687" --> NEO
     end
@@ -32,7 +34,7 @@ graph TD
 
 | Binding | Protocol | Consumer |
 |---|---|---|
-| `127.0.0.1:8000` | HTTP (OpenAI-compatible REST) | Claude Code, any OpenAI-compatible client |
+| `127.0.0.1:8000` | HTTP (Anthropic-compatible) | Claude Code |
 | `127.0.0.1:7687` | Bolt | MCP Neo4j memory server |
 | `127.0.0.1:7474` | HTTP | Neo4j Browser (UI, optional) |
 
@@ -50,7 +52,7 @@ All three ports are bound to `127.0.0.1`, not `0.0.0.0`. No port is reachable fr
 | Docker Compose plugin | ≥ 2.20 | `docker compose` (v2 syntax) |
 | npm | any recent | Only for packing the Claude Code tarball |
 | NVIDIA driver | ≥ 525 | Must match or exceed the target machine's driver |
-| Disk space | ≥ 60 GB free | ~26 GB build + ~30 GB compressed tarball |
+| Disk space | ≥ 65 GB free | ~30 GB build + ~35 GB compressed tarballs |
 
 ### Air-gapped (target) machine
 
@@ -60,7 +62,7 @@ All three ports are bound to `127.0.0.1`, not `0.0.0.0`. No port is reachable fr
 | NVIDIA Container Toolkit | any | Installed from bundled `.deb` files (see [Install on air-gapped machine](#2-install-on-the-air-gapped-machine)) |
 | Docker Engine | ≥ 24.0 | Must already be installed |
 | Docker Compose plugin | ≥ 2.20 | |
-| GPU VRAM | ≥ 20 GB | Qwen3.5-9B at float16 with `--gpu-memory-utilization 0.88` |
+| GPU VRAM | ≥ 16 GB | Qwen2.5-7B-FP8 with massive 64K context window |
 
 #### Install NVIDIA Container Toolkit (connected machine — download only)
 
@@ -88,9 +90,9 @@ cp /var/cache/apt/archives/libnvidia-container*.deb ./air-gapped-claude-code-bun
 
 ## Model download
 
-Qwen3.5-9B is hosted on Hugging Face. The model weights are downloaded once, at Docker image build time, and baked into the image layer. They are never downloaded again at runtime.
+Qwen2.5-7B is hosted on Hugging Face. The model weights are downloaded once, at Docker image build time, and baked into the image layer. This project uses the **FP8 quantized** version (`neuralmagic/Qwen2.5-7B-Instruct-FP8`) to fit within 16GB VRAM while providing a massive **65,536 token** context window.
 
-**Before building**, accept the model license at `https://huggingface.co/Qwen/Qwen3.5-9B` and generate a read-only token at `https://huggingface.co/settings/tokens`.
+**Before building**, accept the model license on Hugging Face and generate a read-only token at `https://huggingface.co/settings/tokens`.
 
 The token is passed as a [BuildKit secret](https://docs.docker.com/build/building/secrets/) — it is mounted only during the `RUN` step that calls `snapshot_download` and is **never written to any image layer**.
 
@@ -104,19 +106,26 @@ The token is passed as a [BuildKit secret](https://docs.docker.com/build/buildin
 # Export your HuggingFace token
 export HF_TOKEN=hf_...
 
-# Build the vLLM image (~26 GB download; 30–90 min depending on bandwidth)
+# Build the vLLM image (~10 GB model download)
 docker build \
   --progress=plain \
   --secret id=HF_TOKEN,env=HF_TOKEN \
   -f Dockerfile.vllm \
   -t air-gapped-claude-code-vllm:latest \
   .
+
+# Build the LiteLLM bridge image (bakes in the config)
+docker build \
+  -f Dockerfile.litellm \
+  -t air-gapped-claude-code-litellm:latest \
+  .
 ```
 
 ```bash
-# Export the vLLM image as a compressed tarball (~30 GB)
+# Export the images as compressed tarballs
 mkdir -p ~/air-gapped-claude-code-bundle
-docker save air-gapped-claude-code-vllm:latest | gzip > ~/air-gapped-claude-code-bundle/air-gapped-claude-code-vllm.tar.gz
+docker save air-gapped-claude-code-vllm:latest | gzip > ~/air-gapped-claude-code-bundle/vllm.tar.gz
+docker save air-gapped-claude-code-litellm:latest | gzip > ~/air-gapped-claude-code-bundle/litellm.tar.gz
 ```
 
 ```bash
@@ -126,11 +135,12 @@ docker save neo4j:5.26-community | gzip > ~/air-gapped-claude-code-bundle/neo4j-
 ```
 
 ```bash
-# Copy the Compose file into the bundle
+# Copy the Compose and config files into the bundle
 cp docker-compose.yml ~/air-gapped-claude-code-bundle/
+cp litellm-config.yaml ~/air-gapped-claude-code-bundle/
 ```
 
-Transfer the entire `~/air-gapped-claude-code-bundle/` directory to the air-gapped machine (USB drive, encrypted transfer, etc.).
+Transfer the entire `~/air-gapped-claude-code-bundle/` directory to the air-gapped machine.
 
 ---
 
@@ -149,8 +159,9 @@ sudo systemctl restart docker
 ```
 
 ```bash
-# Load the Docker images (air-gapped-claude-code-vllm is ~30 GB; takes a few minutes)
-docker load < ./air-gapped-claude-code-bundle/air-gapped-claude-code-vllm.tar.gz
+# Load the Docker images
+docker load < ./air-gapped-claude-code-bundle/vllm.tar.gz
+docker load < ./air-gapped-claude-code-bundle/litellm.tar.gz
 docker load < ./air-gapped-claude-code-bundle/neo4j-5.26-community.tar.gz
 ```
 
@@ -167,12 +178,8 @@ docker compose up -d
 ### 3. Wait for the stack to be ready
 
 ```bash
-# vLLM loads the model from disk; allow 60–120 s after container start
-until curl -sf http://127.0.0.1:8000/health; do printf '.'; sleep 3; done && echo ' vLLM ready'
-
-# Neo4j
-until docker exec air-gapped-claude-code-neo4j cypher-shell -u neo4j -p ac4Sw1Q3Y4W834ctwpNaOq8 "RETURN 1" \
-      > /dev/null 2>&1; do printf '.'; sleep 3; done && echo ' Neo4j ready'
+# LiteLLM gateway (port 8000)
+until curl -sf http://127.0.0.1:8000/health; do printf '.'; sleep 3; done && echo ' Bridge ready'
 ```
 
 ---
@@ -180,13 +187,14 @@ until docker exec air-gapped-claude-code-neo4j cypher-shell -u neo4j -p ac4Sw1Q3
 ### 4. Configure Claude Code
 
 ```bash
-# Point Claude Code at the local vLLM endpoint
-export ANTHROPIC_BASE_URL="http://127.0.0.1:8000/v1"
+# Point Claude Code at the LiteLLM bridge
+# IMPORTANT: Do not include /v1 here, as the Anthropic SDK appends it automatically
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8000"
 export ANTHROPIC_AUTH_TOKEN="airgap-local"
 export ANTHROPIC_API_KEY=""
-
+```
 # (Optional) persist across sessions
-echo 'export ANTHROPIC_BASE_URL="http://127.0.0.1:8000/v1"' >> ~/.bashrc
+echo 'export ANTHROPIC_BASE_URL="http://127.0.0.1:8000"' >> ~/.bashrc
 echo 'export ANTHROPIC_AUTH_TOKEN="airgap-local"' >> ~/.bashrc
 echo 'export ANTHROPIC_API_KEY=""' >> ~/.bashrc
 ```
@@ -231,33 +239,32 @@ claude
 
 | Flag | Value | Description |
 |---|---|---|
-| `--model` | `/models/qwen3.5-9b` | Path to the baked-in model weights inside the image. |
-| `--served-model-name` | `claude-3-5-sonnet-20241022` | Model name returned by `/v1/models`. Set to this value so Claude Code accepts it without extra configuration. |
-| `--dtype` | `float16` | Weight precision. Halves VRAM compared to float32. |
-| `--gpu-memory-utilization` | `0.88` | Fraction of GPU VRAM to allocate for the KV cache. |
-| `--max-model-len` | `32768` | Maximum context window in tokens. |
-| `--max-num-seqs` | `4` | Maximum concurrent sequences (request parallelism). |
-| `--enable-auto-tool-choice` | — | Enables OpenAI-compatible tool/function calling. |
-| `--tool-call-parser` | `hermes` | Parser for Qwen's Hermes-style tool call format. |
+| `--model` | `/models/qwen2.5-7b-fp8` | Path to the baked-in model weights inside the image. |
+| `--served-model-name` | `claude-3-5-sonnet-20241022` | Model name returned by `/v1/models`. |
+| `--gpu-memory-utilization` | `0.90` | Fraction of GPU VRAM to allocate for the KV cache. |
+| `--max-model-len` | `65536` | Maximum context window in tokens. |
+| `--kv-cache-dtype` | `fp8` | Enables FP8 KV cache for massive memory savings. |
+| `--enforce-eager` | — | Disables CUDA graphs to save ~0.5 GB VRAM. |
 
 ---
 
 ## Claude Code integration
 
-Claude Code communicates with the local vLLM instance over the OpenAI-compatible API. Three environment variables control the connection:
+Claude Code communicates with the local LiteLLM bridge over the Anthropic-compatible API. Three environment variables control the connection:
 
 ```bash
-# Required — redirect all API traffic to the local server
-export ANTHROPIC_BASE_URL="http://127.0.0.1:8000/v1"
+# Required — redirect all API traffic to the local bridge
+# IMPORTANT: Do not include /v1 as the SDK appends it automatically
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8000"
 
-# Required — vLLM does not validate API keys; any non-empty string works
+# Required — LiteLLM does not validate API keys; any non-empty string works
 export ANTHROPIC_AUTH_TOKEN="airgap-local"
 
 # Required — must be empty so the SDK does not attempt to use a real key
 export ANTHROPIC_API_KEY=""
 ```
 
-vLLM serves the model under the name `claude-3-5-sonnet-20241022` (configured via `--served-model-name`). Claude Code validates the model name against this string, so no additional model override is needed.
+LiteLLM handles the translation between the Anthropic protocol and the OpenAI protocol used by vLLM. It also aliases multiple Claude model names (e.g., `claude-sonnet-4-6`, `claude-haiku-4-5`) to your local Qwen3.5-9B model.
 
 ### MCP graph memory (optional)
 
@@ -338,11 +345,11 @@ This section documents, for compliance and CISO review, the data categories that
 
 | Data | Location | Never leaves because |
 |---|---|---|
-| Model weights (Qwen3.5-9B, ~18 GB) | Docker image layer (`/models/qwen3.5-9b`) | Baked into the image at build time; no volume mount; no outbound pull at runtime |
-| HuggingFace token | Never persisted | Passed as a BuildKit secret (`--mount=type=secret`); not written to any image layer or build cache |
-| All prompts and completions | In-process memory only | vLLM runs entirely locally; `VLLM_NO_USAGE_STATS=1` disables the only optional outbound call |
-| Conversation graph (Neo4j) | `$NEO4J_DATA` on the host (default: `./neo4j-data`) | Bolt port bound to `127.0.0.1:7687` only |
-| API traffic | Host loopback | All three ports (`8000`, `7474`, `7687`) are bound to `127.0.0.1`, not `0.0.0.0` |
+| Model weights (Qwen2.5-7B-FP8, ~7.5 GB) | Docker image layer (`/models/qwen2.5-7b-fp8`) | Baked into the image at build time; no outbound pull at runtime |
+| HuggingFace token | Never persisted | Passed as a BuildKit secret (`--mount=type=secret`) |
+| All prompts and completions | In-process memory only | vLLM and LiteLLM run entirely locally; telemetry is disabled |
+| Conversation graph (Neo4j) | `$NEO4J_DATA` on the host | Bolt port bound to `127.0.0.1:7687` only |
+| API traffic | Host loopback | All ports (`8000`, `7474`, `7687`) bound to `127.0.0.1` |
 
 **Verifying network isolation at runtime:**
 
@@ -367,12 +374,9 @@ sudo rfkill block all    # disable all wireless interfaces
 
 | Component | Version | License |
 |---|---|---|
-| Base image | `python:3.12-slim` (Debian Bookworm) | Python PSF / Debian |
-| PyTorch | 2.10.0+cu130 | BSD-3-Clause |
-| CUDA runtime (bundled in torch wheel) | 13.0 | NVIDIA CUDA EULA |
 | vLLM | 0.19.0 | Apache-2.0 |
-| huggingface_hub | ≥ 0.24 | Apache-2.0 |
-| Qwen3.5-9B | — | MIT |
+| LiteLLM | latest | MIT |
+| Qwen2.5-7B-FP8 | — | Apache-2.0 |
 | Neo4j Community | 5.26 | GPL-3.0 |
 | NVIDIA Container Toolkit | latest stable | Apache-2.0 |
 | @neo4j/mcp-neo4j-memory | latest | Apache-2.0 |
