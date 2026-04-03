@@ -1,6 +1,6 @@
 FROM ghcr.io/berriai/litellm:main-latest
 
-# Copy the configuration into the image so no mount is needed at runtime
+# Copy the configuration and pre-call hook into the image
 COPY litellm-config.yaml /app/config.yaml
 
 # Set the default command to use the baked-in config

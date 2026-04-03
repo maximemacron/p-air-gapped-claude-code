@@ -1,0 +1,130 @@
+# =============================================================================
+# air-gapped-claude-code — Build and push vLLM image to GHCR
+#
+# This workflow builds the air-gapped-claude-code-vllm image and pushes it to
+# the GitHub Container Registry (ghcr.io).
+#
+# The build downloads ~26 GB (PyTorch cu130 wheel + vLLM + Qwen3.5-9B weights)
+# and produces a ~26 GB image. GitHub-hosted runners have ~14 GB of usable disk
+# space — this workflow MUST run on a self-hosted runner with:
+#   - ≥ 60 GB free disk space
+#   - NVIDIA GPU with driver ≥ 525 (only needed for runtime, not for the build)
+#   - Docker Engine ≥ 24.0 with BuildKit enabled
+#
+# Required repository secret:
+#   HF_TOKEN — read-only HuggingFace token. Accept the Qwen3.5-9B license at
+#              https://huggingface.co/Qwen/Qwen3.5-9B before running.
+# =============================================================================
+
+name: Build vLLM image
+
+on:
+  # Manual trigger — building is slow (~60 min) and produces a large artifact.
+  # Use this to kick off a build on demand rather than on every push.
+  workflow_dispatch:
+    inputs:
+      push_image:
+        description: "Push image to GHCR after build"
+        type: boolean
+        default: true
+
+  # Also build (but do not push) on pull requests that touch the Dockerfile,
+  # to catch breakage early.
+  pull_request:
+    paths:
+      - "Dockerfile.vllm"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/air-gapped-claude-code-vllm
+
+jobs:
+  build:
+    name: Build air-gapped-claude-code-vllm
+    # ⚠ Must be a self-hosted runner — GitHub-hosted runners do not have
+    # enough disk space for this image (~26 GB uncompressed).
+    # Label your runner with 'self-hosted' and 'large-disk' in repo settings.
+    runs-on: [self-hosted, large-disk]
+
+    permissions:
+      contents: read
+      packages: write  # required to push to ghcr.io
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          # Remove pre-installed toolchains that consume space on self-hosted runners
+          docker system prune -f --volumes || true
+          df -h
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # Use the host's docker daemon (avoids a second daemon eating RAM).
+          driver: docker
+
+      - name: Log in to GHCR
+        # Only authenticate when we intend to push.
+        if: >
+          github.event_name == 'workflow_dispatch' &&
+          inputs.push_image == true
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Always tag :latest on the default branch
+            type=raw,value=latest,enable={{is_default_branch}}
+            # Tag with the short commit SHA for traceability
+            type=sha,prefix=sha-,format=short
+            # Tag with the date so builds are easily identified
+            type=raw,value={{date 'YYYY-MM-DD'}}
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.vllm
+          # Push only when explicitly requested via workflow_dispatch
+          push: >-
+            ${{
+              github.event_name == 'workflow_dispatch' &&
+              inputs.push_image == true
+            }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Pass the HuggingFace token as a BuildKit secret.
+          # It is mounted only during the RUN step that downloads weights and
+          # is never written to any image layer.
+          secrets: |
+            HF_TOKEN=${{ secrets.HF_TOKEN }}
+          # Inline cache: store cache layers inside the image manifest.
+          # This lets a subsequent build reuse the torch/vLLM layers even if
+          # the runner has no local cache (e.g. after a fresh runner provision).
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache
+          cache-to: >-
+            ${{
+              github.event_name == 'workflow_dispatch' &&
+              inputs.push_image == true &&
+              'type=registry,ref=' + env.REGISTRY + '/' + env.IMAGE_NAME + ':cache,mode=max' ||
+              ''
+            }}
+
+      - name: Image digest
+        if: >
+          github.event_name == 'workflow_dispatch' &&
+          inputs.push_image == true
+        run: |
+          echo "Image pushed:"
+          echo "  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo "  Digest: ${{ steps.build-push.outputs.digest }}"

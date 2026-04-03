@@ -1,10 +1,9 @@
 model_list:
   - model_name: "*"
     litellm_params:
-      model: "openai/claude-3-5-sonnet-20241022"
+      model: "hosted_vllm/claude-3-5-sonnet-20241022"
       api_base: "http://vllm:8000/v1"
       api_key: "not-needed"
-      use_responses_api: false
 
 litellm_settings:
   drop_params: true

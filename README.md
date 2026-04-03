@@ -4,7 +4,7 @@ Run [Claude Code](https://docs.anthropic.com/en/docs/claude-code) with a locally
 
 ## Problem statement
 
-Financial institutions, defence contractors, and healthcare providers routinely operate developer workstations in network-isolated environments: no outbound internet, strict data-residency requirements, and continuous monitoring for exfiltration. Commercial AI coding assistants send every prompt and code snippet to a remote API, which is incompatible with these controls. This project packages a production-grade OpenAI-compatible inference server (vLLM + Qwen2.5-14B), a translation bridge (LiteLLM), and a persistent graph memory store (Neo4j) into a Docker Compose stack that binds exclusively to `127.0.0.1`, satisfies a two-person rule for model provenance (weights are baked in at build time on a controlled connected machine), and requires zero network access at runtime. Claude Code connects to the local LiteLLM endpoint, which translates Anthropic-style requests into vLLM-compatible commands.
+Financial institutions, defence contractors, and healthcare providers routinely operate developer workstations in network-isolated environments: no outbound internet, strict data-residency requirements, and continuous monitoring for exfiltration. Commercial AI coding assistants send every prompt and code snippet to a remote API, which is incompatible with these controls. This project packages a production-grade OpenAI-compatible inference server (vLLM + Qwen2.5-7B-FP8), a translation bridge (LiteLLM), and a persistent graph memory store (Neo4j) into a Docker Compose stack that binds exclusively to `127.0.0.1`, satisfies a two-person rule for model provenance (weights are baked in at build time on a controlled connected machine), and requires zero network access at runtime. Claude Code connects to the local LiteLLM endpoint, which translates Anthropic-style requests into vLLM-compatible commands.
 
 ---
 
@@ -18,7 +18,7 @@ graph TD
 
         subgraph DOCKER ["Docker network: air-gapped-claude-code-net (bridge)"]
             LITE["air-gapped-claude-code-litellm\nLiteLLM Bridge\nPort 8000"]
-            VLLM["air-gapped-claude-code-vllm\nvLLM 0.19.0\nQwen2.5-14B-GPTQ-Int4\nInternal Port 8000"]
+            VLLM["air-gapped-claude-code-vllm\nvLLM 0.19.0\nQwen2.5-7B-FP8\nInternal Port 8000"]
             NEO["air-gapped-claude-code-neo4j\nNeo4j 5.26 Community\nBolt 7687 / Browser 7474"]
         end
 
@@ -62,7 +62,7 @@ All three ports are bound to `127.0.0.1`, not `0.0.0.0`. No port is reachable fr
 | NVIDIA Container Toolkit | any | Installed from bundled `.deb` files (see [Install on air-gapped machine](#2-install-on-the-air-gapped-machine)) |
 | Docker Engine | ≥ 24.0 | Must already be installed |
 | Docker Compose plugin | ≥ 2.20 | |
-| GPU VRAM | ≥ 16 GB | Qwen2.5-14B-GPTQ-Int4: ~8 GB weights + ~6 GB FP8 KV cache (65K context) |
+| GPU VRAM | ≥ 16 GB | Qwen2.5-7B-FP8: ~7.5 GB weights + ~5.5 GB FP8 KV cache (65K context) |
 
 #### Install NVIDIA Container Toolkit (connected machine — download only)
 
@@ -90,7 +90,7 @@ cp /var/cache/apt/archives/libnvidia-container*.deb ./air-gapped-claude-code-bun
 
 ## Model download
 
-Qwen2.5-14B is hosted on Hugging Face. The model weights are downloaded once, at Docker image build time, and baked into the image layer. This project uses the **GPTQ INT4 quantized** version (`Qwen/Qwen2.5-14B-Instruct-GPTQ-Int4`): ~8 GB of weights on a 16 GB GPU, with ~6 GB remaining for FP8 KV cache — enough for a **65,536 token** context window. 128K is not achievable on 16 GB VRAM with a 14B model (weights + KV cache would exceed available memory).
+Qwen2.5-14B is hosted on Hugging Face. The model weights are downloaded once, at Docker image build time, and baked into the image layer. This project uses the official **`Qwen/Qwen2.5-7B-Instruct`** model (BF16 weights, ~14 GB download) with runtime FP8 quantization applied by vLLM at load time — reducing the in-VRAM footprint to ~7.5 GB and leaving ~5.5 GB for FP8 KV cache, enough for a **65,536 token** context window. On this hardware a 14B model leaves too little room for KV cache; the 7B model provides a much larger context window, which matters more than raw model size for a coding assistant that must hold entire codebases in context.
 
 **Before building**, accept the model license on Hugging Face and generate a read-only token at `https://huggingface.co/settings/tokens`.
 
@@ -239,12 +239,12 @@ claude
 
 | Flag | Value | Description |
 |---|---|---|
-| `--model` | `/models/qwen2.5-14b-gptq-int4` | Path to the baked-in model weights inside the image. |
+| `--model` | `/models/qwen2.5-7b-fp8` | Path to the baked-in model weights inside the image. |
 | `--served-model-name` | `claude-3-5-sonnet-20241022` | Model name returned by `/v1/models`. |
-| `--quantization` | `gptq` | Activates GPTQ INT4 kernel; must match the checkpoint format. |
+| `--quantization` | `fp8` | Activates FP8 kernel; must match the pre-quantized checkpoint format. |
 | `--gpu-memory-utilization` | `0.90` | Fraction of GPU VRAM to allocate for model + KV cache. |
-| `--max-model-len` | `65536` | Maximum context window in tokens (hardware ceiling on 16 GB). |
-| `--kv-cache-dtype` | `fp8` | FP8 KV cache roughly halves KV memory vs FP16, enabling 65K context. |
+| `--max-model-len` | `65536` | Maximum context window in tokens — covers large file reads and long sessions. |
+| `--kv-cache-dtype` | `fp8` | FP8 KV cache roughly halves KV memory vs FP16, enabling 65K context on 5.5 GB. |
 | `--enforce-eager` | — | Disables CUDA graphs to save ~0.5 GB VRAM. |
 
 ---
@@ -265,23 +265,24 @@ export ANTHROPIC_AUTH_TOKEN="airgap-local"
 export ANTHROPIC_API_KEY=""
 ```
 
-LiteLLM handles the translation between the Anthropic protocol and the OpenAI protocol used by vLLM. It also aliases multiple Claude model names (e.g., `claude-sonnet-4-6`, `claude-haiku-4-5`) to your local Qwen2.5-14B model.
+LiteLLM handles the translation between the Anthropic protocol and the OpenAI protocol used by vLLM. It also aliases multiple Claude model names (e.g., `claude-sonnet-4-6`, `claude-haiku-4-5`) to your local Qwen2.5-7B-FP8 model.
 
 ### MCP graph memory (optional)
 
-The Neo4j graph memory server gives Claude Code persistent, structured memory across sessions. Configure it by writing `~/.claude/mcp_config.json`:
+The Neo4j graph memory server gives Claude Code persistent, structured memory across sessions. Configure it by writing `~/.claude.json`:
 
 ```json
 {
   "mcpServers": {
     "graph-memory": {
-      "command": "npx",
-      "args": ["-y", "@neo4j/mcp-neo4j-memory"],
+      "command": "uvx",
+      "args": [
+        "mcp-neo4j-memory@0.4.5"
+      ],
       "env": {
-        "NEO4J_URI": "bolt://localhost:7687",
-        "NEO4J_USER": "neo4j",
-        "NEO4J_PASSWORD": "ac4Sw1Q3Y4W834ctwpNaOq8",
-        "NEO4J_DATABASE": "memory"
+        "NEO4J_URL": "bolt://localhost:7687",
+        "NEO4J_USERNAME": "neo4j",
+        "NEO4J_PASSWORD": "ac4Sw1Q3Y4W834ctwpNaOq8"
       }
     }
   }
@@ -346,7 +347,7 @@ This section documents, for compliance and CISO review, the data categories that
 
 | Data | Location | Never leaves because |
 |---|---|---|
-| Model weights (Qwen2.5-14B-GPTQ-Int4, ~8 GB) | Docker image layer (`/models/qwen2.5-14b-gptq-int4`) | Baked into the image at build time; no outbound pull at runtime |
+| Model weights (Qwen2.5-7B-Instruct, ~14 GB BF16 → ~7.5 GB FP8 in VRAM) | Docker image layer (`/models/qwen2.5-7b-fp8`) | Baked into the image at build time; no outbound pull at runtime |
 | HuggingFace token | Never persisted | Passed as a BuildKit secret (`--mount=type=secret`) |
 | All prompts and completions | In-process memory only | vLLM and LiteLLM run entirely locally; telemetry is disabled |
 | Conversation graph (Neo4j) | `$NEO4J_DATA` on the host | Bolt port bound to `127.0.0.1:7687` only |
@@ -377,7 +378,7 @@ sudo rfkill block all    # disable all wireless interfaces
 |---|---|---|
 | vLLM | 0.19.0 | Apache-2.0 |
 | LiteLLM | latest | MIT |
-| Qwen2.5-14B-Instruct-GPTQ-Int4 | — | Apache-2.0 |
+| Qwen/Qwen2.5-7B-Instruct | — | Apache-2.0 |
 | Neo4j Community | 5.26 | GPL-3.0 |
 | NVIDIA Container Toolkit | latest stable | Apache-2.0 |
 | @neo4j/mcp-neo4j-memory | latest | Apache-2.0 |

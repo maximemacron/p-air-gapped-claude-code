@@ -11,11 +11,13 @@
 #   - NVIDIA driver >= 525
 #   - nvidia-container-toolkit
 #
-# Model: Qwen2.5-14B-Instruct-GPTQ-Int4
-#   - Weights: ~8 GB (INT4 + GPTQ scales)
+# Model: Qwen/Qwen2.5-7B-Instruct (BF16, runtime FP8 quantization)
+#   - Download: ~14 GB BF16; vLLM quantizes to FP8 at load → ~7.5 GB in VRAM
 #   - GPU: RTX 5000 Ada Generation (16 GB VRAM)
-#   - KV cache: FP8, ~6.4 GB available → ~68K token capacity
-#   - Max context: 65536 tokens (hardware ceiling on 16 GB; 128K would OOM)
+#   - KV cache: FP8, ~5.5 GB available at 0.90 utilization → ~65K token ceiling
+#   - Max context: 65536 tokens — covers large file reads and long sessions
+#   - Smaller than 14B but context window matters more than model size for a
+#     coding assistant that holds entire codebases in context
 #
 # Layer order is intentional — model download is placed before any layer
 # likely to change so it is not re-fetched on every rebuild:
@@ -48,8 +50,8 @@ from huggingface_hub import snapshot_download; \
 secret = '/run/secrets/HF_TOKEN'; \
 token = open(secret).read().strip() if os.path.exists(secret) else None; \
 snapshot_download( \
-    repo_id='Qwen/Qwen2.5-14B-Instruct-GPTQ-Int4', \
-    local_dir='/models/qwen2.5-14b-gptq-int4', \
+    repo_id='Qwen/Qwen2.5-7B-Instruct', \
+    local_dir='/models/qwen2.5-7b-fp8', \
     ignore_patterns=['*.gguf', 'original/*'], \
     token=token, \
 )" \
@@ -67,9 +69,9 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
 # ── Inference server ──────────────────────────────────────────────────────────
 ENTRYPOINT ["vllm", "serve"]
 CMD [ \
-  "/models/qwen2.5-14b-gptq-int4", \
+  "/models/qwen2.5-7b-fp8", \
   "--served-model-name",      "claude-3-5-sonnet-20241022", \
-  "--quantization",           "gptq", \
+  "--quantization",           "fp8", \
   "--gpu-memory-utilization", "0.90", \
   "--max-model-len",          "65536", \
   "--kv-cache-dtype",         "fp8", \
